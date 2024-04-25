@@ -672,6 +672,69 @@ void _FlashInferBatchQKApplyRotaryInPlace(DLTensor* q, DLTensor* k, DLTensor* in
       })});
 }
 
+void _FlashInferAppendPagedKVCache(DLTensor* append_k, DLTensor* append_v, DLTensor* append_indptr,
+                                   DLTensor* kv_data, DLTensor* kv_indptr, DLTensor* kv_indices, 
+                                   DLTensor* kv_last_page_lens) {
+  CHECK_EQ(append_k->device.device_type, kDLCUDA) << "The device of append_k must be CUDA.";
+  CHECK_EQ(append_v->device.device_type, kDLCUDA) << "The device of append_v must be CUDA.";
+  CHECK_EQ(append_indptr->device.device_type, kDLCUDA) << "The device of append_indptr must be CUDA.";
+  CHECK_EQ(kv_data->device.device_type, kDLCUDA) << "The device of kv_data must be CUDA.";
+  CHECK_EQ(kv_indptr->device.device_type, kDLCUDA) << "The device of kv_indptr must be CUDA.";
+  CHECK_EQ(kv_indices->device.device_type, kDLCUDA) << "The device of kv_indices must be CUDA.";
+  CHECK_EQ(kv_last_page_lens->device.device_type, kDLCUDA) << "The device of kv_last_page_lens must be CUDA.";
+  
+  int32_t dev_id = kv_data->device.device_id;
+  CHECK_EQ(append_k->device.device_id, dev_id);
+  CHECK_EQ(append_v->device.device_id, dev_id);
+  CHECK_EQ(append_indptr->device.device_id, dev_id);
+  CHECK_EQ(kv_indptr->device.device_id, dev_id);
+  CHECK_EQ(kv_indices->device.device_id, dev_id);
+  CHECK_EQ(kv_last_page_lens->device.device_id, dev_id);
+
+  CHECK_EQ(append_k->ndim, 3);
+  CHECK_EQ(append_v->ndim, 3);
+  CHECK_EQ(append_indptr->ndim, 1);
+  CHECK_EQ(kv_data->ndim, 5);
+  CHECK_EQ(kv_indptr->ndim, 1);
+  CHECK_EQ(kv_indices->ndim, 1);
+  CHECK_EQ(kv_last_page_lens->ndim, 1);
+
+
+  int64_t num_heads = kv_data->shape[2];
+  int64_t page_size = kv_data->shape[3];
+  int64_t head_dim = kv_data->shape[4];
+  
+  // CHECK_EQ(s->shape[0], batch_size);
+  // CHECK_EQ(s->shape[1], num_heads);
+  // CHECK_EQ(v_other->shape[0], batch_size);
+  // CHECK_EQ(v_other->shape[1], num_heads);
+  // CHECK_EQ(v_other->shape[2], head_dim);
+  // CHECK_EQ(s_other->shape[0], batch_size);
+  // CHECK_EQ(s_other->shape[1], num_heads);
+
+  int64_t batch_size = kv_last_page_lens->shape[0];
+
+  constexpr PageStorage page_storage = PageStorage::kIndices;
+  constexpr QKVLayout kv_layout = QKVLayout::kHND;
+                                  
+  DISPATCH_TVM_CUDA_DTYPE(kv_data->dtype, c_type, {
+    DISPATCH_TVM_CUDA_IDTYPE(kv_indptr->dtype, idtype, {
+      paged_kv_t<page_storage, kv_layout, c_type, idtype> paged_kv(
+        num_heads, page_size, head_dim, batch_size, static_cast<c_type*>(kv_data->data),
+        static_cast<idtype*>(kv_indices->data), static_cast<idtype*>(kv_indptr->data),
+        static_cast<idtype*>(kv_last_page_lens->data));
+
+      cudaError_t status = AppendPagedKVCache(
+        paged_kv, static_cast<c_type*>(append_k->data), static_cast<c_type*>(append_v->data),
+        static_cast<idtype*>(append_indptr->data), /*stream=*/0);
+      if (status != cudaSuccess) {
+        LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
+      }
+    })
+  });
+}
+
+
 TVM_REGISTER_GLOBAL("flashinfer.attention_kernel_prefill_with_paged_kv_cache")
     .set_body_typed(_FlashInferAttentionPrefillWithPagedKVCache);
 
@@ -709,3 +772,5 @@ TVM_REGISTER_GLOBAL("flashinfer.batch_qk_apply_rotary_in_place")
 TVM_REGISTER_GLOBAL("flashinfer.single_prefill")
     .set_body_typed(_FlashInferSinglePrefillWithKVCache);
 TVM_REGISTER_GLOBAL("flashinfer.single_decode").set_body_typed(_FlashInferSingleDecodeWithKVCache);
+
+TVM_REGISTER_GLOBAL("flashinfer.append_paged_kv_cache").set_body_typed(_FlashInferAppendPagedKVCache);
